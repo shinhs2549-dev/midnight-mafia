@@ -72,6 +72,33 @@ function alivePlayers(room) {
 function alivePlayersByRole(room, role) {
   return alivePlayers(room).filter((p) => p.role === role);
 }
+function deadPlayers(room) {
+  return Object.values(room.players).filter((p) => !p.alive && !p.removed);
+}
+
+// 죽은 사람에게 관전 정보(전체 역할 공개 + 밤 진행 상황)를 전송
+function sendSpectatorState(room) {
+  const dead = deadPlayers(room).filter((p) => p.connected);
+  if (!dead.length) return;
+  const roster = Object.values(room.players)
+    .filter((p) => !p.removed)
+    .map((p) => ({ name: p.name, roleKo: p.role ? ROLE_KO[p.role] : null, role: p.role, alive: p.alive }));
+  const payload = {
+    phase: room.phase,
+    round: room.round,
+    roster,
+    night: room.phase === 'night' ? collectNightProgress(room) : null,
+  };
+  dead.forEach((d) => io.to(d.id).emit('spectator:update', payload));
+}
+
+// 새로 죽은 사람을 유령으로 합류시키고 채팅 내역을 전달
+function enterGhost(room, player) {
+  io.to(player.id).emit('ghost:init', { history: room.ghostChat });
+  const sys = { sys: true, text: `${player.name} 님이 유령이 되었습니다.`, t: Date.now() };
+  room.ghostChat.push(sys);
+  deadPlayers(room).forEach((d) => io.to(d.id).emit('chat:ghost:msg', sys));
+}
 
 // ---------------------------------------------------------------------------
 // 상태 전송 헬퍼
@@ -121,7 +148,7 @@ function collectNightProgress(room) {
   return {
     mafiaPicks: Object.entries(n.mafiaVotes).map(([v, t]) => ({ voter: nameOf(v), target: nameOf(t) })),
     policeChecks: n.policeDone.map((id) => nameOf(id)),
-    doctorProtect: n.doctorProtect ? nameOf(n.doctorProtect) : null,
+    doctorProtect: Object.values(n.doctorProtects).map((id) => nameOf(id)),
     townVoteCount: Object.keys(n.townVotes).length,
     timerEnd: n.timerEnd,
   };
@@ -173,6 +200,7 @@ io.on('connection', (socket) => {
       config: { mafia: 0, police: 0, doctor: 0, citizen: 0 },
       night: null,
       lastResult: null,
+      ghostChat: [],
     };
     socket.join(code);
     socket.data = { roomCode: code, isHost: true };
@@ -216,7 +244,11 @@ io.on('connection', (socket) => {
       // 진행 중이면 현재 상태 다시 보내주기
       if (existing.role) socket.emit('player:role', { roleKo: ROLE_KO[existing.role], role: existing.role });
       if (room.phase === 'night' && existing.alive) sendNightToPlayer(room, existing);
-      if (!existing.alive) socket.emit('you:dead', {});
+      if (!existing.alive) {
+        socket.emit('you:dead', {});
+        socket.emit('ghost:init', { history: room.ghostChat });
+        sendSpectatorState(room);
+      }
       sendHostState(room);
       return;
     }
@@ -225,7 +257,7 @@ io.on('connection', (socket) => {
       return cb && cb({ ok: false, msg: '게임이 이미 시작됐어요. 사회자에게 문의하세요.' });
     }
 
-    const player = { id: socket.id, name, role: null, alive: true, connected: true, removed: false };
+    const player = { id: socket.id, name, role: null, alive: true, connected: true, removed: false, selfHeals: 0 };
     room.players[socket.id] = player;
     socket.join(code);
     socket.data = { roomCode: code, isHost: false, playerId: socket.id };
@@ -278,7 +310,9 @@ io.on('connection', (socket) => {
     shuffledPlayers.forEach((p, i) => {
       p.role = pool[i];
       p.alive = true;
+      p.selfHeals = 0;
     });
+    room.ghostChat = [];
 
     room.started = true;
     room.phase = 'assigned';
@@ -315,7 +349,7 @@ io.on('connection', (socket) => {
     room.night = {
       mafiaVotes: {},     // voterId -> targetId
       townVotes: {},      // voterId -> targetId (마피아 표는 집계에서 제외)
-      doctorProtect: null,
+      doctorProtects: {}, // doctorId -> targetId (의사별 보호 대상)
       policeDone: [],     // 이번 밤 조사 완료한 경찰 id
       anon,
       suspects,
@@ -326,6 +360,7 @@ io.on('connection', (socket) => {
 
     alive.forEach((p) => sendNightToPlayer(room, p));
     sendHostState(room);
+    sendSpectatorState(room);
   });
 
   // ---- 밤 지목(역할별 의미가 다름) ----
@@ -347,14 +382,24 @@ io.on('connection', (socket) => {
       const isMafia = target.role === ROLE.MAFIA;
       io.to(me.id).emit('police:result', { name: target.name, isMafia });
     } else if (me.role === ROLE.DOCTOR) {
-      room.night.doctorProtect = targetId;
-      io.to(me.id).emit('action:ack', { msg: `${target.name} 님을 보호합니다.` });
+      const isSelf = targetId === me.id;
+      if (isSelf && (me.selfHeals || 0) >= 2) {
+        io.to(me.id).emit('action:ack', { msg: '셀프힐은 게임당 2번까지만 가능해요.' });
+        return;
+      }
+      room.night.doctorProtects[me.id] = targetId;
+      io.to(me.id).emit('action:ack', {
+        msg: isSelf
+          ? `자신을 보호합니다. (셀프힐 ${(me.selfHeals || 0) + 1}/2)`
+          : `${target.name} 님을 보호합니다.`,
+      });
     } else {
       // 시민(+위장상 다른 town): 마을 여론 투표 (참고용, 시민 표만 집계)
       room.night.townVotes[me.id] = targetId;
       io.to(me.id).emit('action:ack', { msg: `${target.name} 님을 지목했습니다.` });
     }
     sendHostState(room);
+    sendSpectatorState(room);
   });
 
   // ---- 채팅: 마피아 ----
@@ -385,6 +430,19 @@ io.on('connection', (socket) => {
     alivePlayers(room).forEach((p) => io.to(p.id).emit('chat:town:msg', msg));
   });
 
+  // ---- 채팅: 유령(죽은 사람끼리) ----
+  socket.on('chat:ghost', ({ text }) => {
+    const room = getPlayerRoom(socket);
+    if (!room) return;
+    const me = room.players[socket.id];
+    if (!me || me.alive || me.removed) return; // 죽은 사람만(완전퇴장 제외)
+    text = String(text || '').slice(0, 200).trim();
+    if (!text) return;
+    const msg = { name: me.name, text, t: Date.now() };
+    room.ghostChat.push(msg);
+    deadPlayers(room).forEach((d) => io.to(d.id).emit('chat:ghost:msg', msg));
+  });
+
   // ---- 사회자: 밤 종료 → 결과 처리 ----
   socket.on('host:endNight', () => {
     const room = getHostRoom(socket);
@@ -400,11 +458,13 @@ io.on('connection', (socket) => {
     if (!target || !target.alive || target.removed) return;
     target.alive = false;
     io.to(target.id).emit('you:dead', {});
+    enterGhost(room, target);
     io.to(room.code).emit('day:execution', { name: target.name, roleKo: ROLE_KO[target.role] });
     room.phase = 'day';
     const w = checkWin(room);
     if (w) return endGame(room, w);
     sendHostState(room);
+    sendSpectatorState(room);
   });
 
   // ---- 사회자: 처형 없이 넘어가기(부결) ----
@@ -424,6 +484,7 @@ io.on('connection', (socket) => {
     if (asDeath) {
       target.alive = false;
       io.to(target.id).emit('you:dead', { msg: '게임에서 제외되었습니다.' });
+      enterGhost(room, target);
     } else {
       target.removed = true;
       target.alive = false;
@@ -438,16 +499,16 @@ io.on('connection', (socket) => {
   socket.on('host:newGame', () => {
     const room = getHostRoom(socket);
     if (!room) return;
+    // 완전 퇴장한 사람은 빼고, 나머지는 초기화
     Object.values(room.players).forEach((p) => {
-      p.role = null; p.alive = true; p.removed = p.removed && false ? false : p.removed;
+      if (!p.removed) { p.role = null; p.alive = true; p.selfHeals = 0; }
     });
-    // 제외됐던(나간) 사람은 그대로 빼고, 나머지 초기화
-    Object.values(room.players).forEach((p) => { if (!p.removed) { p.role = null; p.alive = true; } });
     room.started = false;
     room.phase = 'lobby';
     room.round = 0;
     room.night = null;
     room.lastResult = null;
+    room.ghostChat = [];
     io.to(room.code).emit('game:reset', {});
     sendHostState(room);
   });
@@ -488,8 +549,9 @@ function resolveNight(room) {
   if (top.length) killTarget = top[Math.floor(Math.random() * top.length)];
 
   let killedName = null, killedRole = null, saved = false;
+  const protectedIds = new Set(Object.values(n.doctorProtects));
   if (killTarget) {
-    if (n.doctorProtect === killTarget) {
+    if (protectedIds.has(killTarget)) {
       saved = true;
     } else {
       const victim = room.players[killTarget];
@@ -498,9 +560,17 @@ function resolveNight(room) {
         killedName = victim.name;
         killedRole = ROLE_KO[victim.role];
         io.to(victim.id).emit('you:dead', {});
+        enterGhost(room, victim);
       }
     }
   }
+
+  // 셀프힐 소진: 자신을 보호한 의사는 카운트 +1
+  Object.entries(n.doctorProtects).forEach(([docId, tId]) => {
+    if (docId === tId && room.players[docId]) {
+      room.players[docId].selfHeals = (room.players[docId].selfHeals || 0) + 1;
+    }
+  });
 
   // 마을 여론 집계: "시민 진영"(비마피아) 표만 집계, 마피아 표는 폐기
   const townTally = {};
@@ -530,6 +600,7 @@ function resolveNight(room) {
   const w = checkWin(room);
   if (w) return endGame(room, w);
   sendHostState(room);
+  sendSpectatorState(room);
 }
 
 // ---------------------------------------------------------------------------
