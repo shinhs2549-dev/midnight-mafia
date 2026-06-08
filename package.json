@@ -1,0 +1,17 @@
+{
+  "name": "midnight-mafia",
+  "version": "1.0.0",
+  "description": "수학여행용 스마트폰 마피아 게임 - 사회자 진행형 실시간 웹앱",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
