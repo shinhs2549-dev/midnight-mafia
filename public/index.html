@@ -322,11 +322,24 @@
       <div class="banner peace" style="margin-top:14px;">이제 다 같이 토론하세요!<br/>의심되는 사람을 찾아 투표로 처형합니다.</div>
     </div>
 
-    <!-- 사망 -->
+    <!-- 사망: 유령 모드 -->
     <div class="panel center hide" id="pDead">
-      <div style="font-size:46px;">💀</div>
-      <h2>사망</h2>
-      <p class="muted small">아쉽지만 탈락했어요.<br/>조용히 게임을 지켜봐 주세요. (정보 흘리기 금지!)</p>
+      <div style="font-size:42px;">💀</div>
+      <h2>사망 · 유령 모드</h2>
+      <p class="muted small">이제 모두의 역할이 보여요.<br/>산 사람에게 정보를 흘리면 안 돼요! 👻</p>
+    </div>
+    <div class="panel hide" id="pSpectate">
+      <div class="row between"><h2 style="margin:0">👁️ 관전</h2><span class="pill" id="specPhase">—</span></div>
+      <div id="specNight" class="small" style="margin:10px 0;"></div>
+      <div class="plist" id="specRoster"></div>
+    </div>
+    <div class="panel hide" id="pGhost">
+      <h2>👻 유령 채팅</h2>
+      <div class="chatbox" id="ghostChat" style="height:170px;"></div>
+      <div class="chatinput">
+        <input type="text" id="ghostMsg" placeholder="유령끼리 수다 떨기…" maxlength="200" />
+        <button id="ghostSend" style="background:#6b8cff;color:#fff;">전송</button>
+      </div>
     </div>
 
     <!-- 종료 -->
@@ -492,7 +505,7 @@ function renderHostNight(st){
   const kills = ni.mafiaPicks.length ? ni.mafiaPicks.map(x=>`${esc(x.voter)}→<b style="color:#ff918d">${esc(x.target)}</b>`).join(', ') : '<span class="muted">아직 없음</span>';
   line('🔪 마피아 지목', kills);
   line('🚔 경찰 조사완료', ni.policeChecks.length ? ni.policeChecks.map(esc).join(', ') : '<span class="muted">아직 없음</span>');
-  line('🩺 의사 보호', ni.doctorProtect ? `<b style="color:#7fe0ad">${esc(ni.doctorProtect)}</b>` : '<span class="muted">아직 없음</span>');
+  line('🩺 의사 보호', (ni.doctorProtect && ni.doctorProtect.length) ? `<b style="color:#7fe0ad">${ni.doctorProtect.map(esc).join(', ')}</b>` : '<span class="muted">아직 없음</span>');
   line('🗳️ 마을 투표 참여', ni.townVoteCount + '명');
 }
 
@@ -518,6 +531,7 @@ function renderHostDay(st){
 // PLAYER
 // =================================================================
 let playerName=null, playerCode=null;
+let amDead=false;
 function enterPlayer(name, code, rejoined){
   playerName=name; playerCode=code;
   hide('view-home'); show('view-player');
@@ -527,8 +541,12 @@ function enterPlayer(name, code, rejoined){
   if(rejoined) toast('재접속했어요. 진행 상황을 불러옵니다.');
 }
 function playerPanels(activeId){
-  ['pWaiting','pRole','pNight','pDay','pDead','pEnded'].forEach(hide);
+  ['pWaiting','pRole','pNight','pDay','pDead','pEnded','pSpectate','pGhost'].forEach(hide);
   if(activeId) show(activeId);
+}
+function showDeadView(){
+  ['pWaiting','pRole','pNight','pDay','pEnded'].forEach(hide);
+  show('pDead'); show('pSpectate'); show('pGhost');
 }
 
 socket.on('player:role', ({role, roleKo})=>{
@@ -544,6 +562,7 @@ socket.on('player:role', ({role, roleKo})=>{
 });
 
 socket.on('phase:night', (n)=>{
+  if(amDead) return;
   playerPanels('pNight');
   myRole = n.role;
   actionType = n.action.type;
@@ -622,6 +641,7 @@ socket.on('police:result', ({name, isMafia})=>{
 socket.on('action:ack', ({msg})=>{ $('pActionMsg').textContent = msg; });
 
 socket.on('phase:day', (d)=>{
+  if(amDead) return;
   playerPanels('pDay');
   $('pDayRound').textContent = d.round;
   const b=$('pDayBanner');
@@ -639,9 +659,49 @@ socket.on('day:execution', ({name, roleKo})=>{
   if(name) toast(`${name} 님이 처형되었습니다. (${roleKo})`);
 });
 
-socket.on('you:dead', ()=>{ playerPanels('pDead'); });
-socket.on('removed', ()=>{ playerPanels('pDead'); });
-socket.on('game:reset', ()=>{ playerPanels('pWaiting'); myRole=null; });
+socket.on('you:dead', ()=>{ amDead=true; showDeadView(); });
+socket.on('removed', ()=>{ amDead=false; playerPanels('pDead'); });
+socket.on('game:reset', ()=>{ amDead=false; $('ghostChat').innerHTML=''; playerPanels('pWaiting'); myRole=null; });
+
+// ----- 관전(유령) -----
+socket.on('spectator:update', (s)=>{
+  if(!amDead) return;
+  const lbl = s.phase==='night' ? ('🌙 '+s.round+'일차 밤')
+            : s.phase==='day' ? ('☀️ '+s.round+'일차 낮')
+            : s.phase==='ended' ? '게임 종료' : '대기 중';
+  $('specPhase').textContent = lbl;
+  const ni=$('specNight'); ni.innerHTML='';
+  if(s.night){
+    const t = s.night.mafiaPicks.length
+      ? s.night.mafiaPicks.map(x=>esc(x.target)).join(', ')
+      : '<span class="muted">아직 미정</span>';
+    const doc = s.night.doctorProtect && s.night.doctorProtect.length
+      ? s.night.doctorProtect.map(esc).join(', ') : '<span class="muted">미정</span>';
+    ni.innerHTML = `🔪 마피아 표적: <b style="color:#ff918d">${t}</b><br/>🩺 의사 보호: ${doc}`;
+  }
+  const box=$('specRoster'); box.innerHTML='';
+  s.roster.forEach(p=>{
+    const it=document.createElement('div'); it.className='pitem'+(p.alive?'':' dead');
+    const rl = p.role ? `<span class="rl ${p.role}">${p.roleKo}</span>` : '';
+    it.innerHTML=`<span class="nm">${esc(p.name)}</span>${rl}`;
+    box.appendChild(it);
+  });
+});
+socket.on('ghost:init', ({history})=>{
+  const box=$('ghostChat'); box.innerHTML='';
+  (history||[]).forEach(addGhostMsg);
+  box.scrollTop=box.scrollHeight;
+});
+socket.on('chat:ghost:msg', addGhostMsg);
+function addGhostMsg(m){
+  const box=$('ghostChat'); const d=document.createElement('div');
+  if(m.sys){ d.className='msg sys'; d.textContent=m.text; }
+  else { d.className='msg'; d.innerHTML=`<span class="who" style="color:#9db3ff">${esc(m.name)}</span>${esc(m.text)}`; }
+  box.appendChild(d); box.scrollTop=box.scrollHeight;
+}
+$('ghostSend').onclick=sendGhost;
+$('ghostMsg').addEventListener('keydown',e=>{if(e.key==='Enter')sendGhost();});
+function sendGhost(){ const t=$('ghostMsg').value.trim(); if(!t)return; socket.emit('chat:ghost',{text:t}); $('ghostMsg').value=''; }
 
 socket.on('game:over', ({winner, reveal})=>{
   // 호스트
